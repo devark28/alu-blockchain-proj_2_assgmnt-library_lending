@@ -1,386 +1,472 @@
-# Library Book Lending Tracker: how it works
+# Token Rewards and Mining: how it works
 
-## The target goal
+## Goal
 
-Paper lending logs can be edited after the fact: a lost book can be quietly
-marked as returned, or a borrower can dispute what the log says. A lending tracker in C where every borrow and return is recorded as a block in a blockchain, so that:
+The base tracker recorded every borrow and return as a signed, hash-linked
+block. This version turns those records into an economy:
 
-- a record cannot be changed without the change being detected (SHA-256
-  hashes linking each block to the one before it)
-- a record can be traced to someone who was allowed to create it
-  (ECDSA digital signatures)
-- only books and members that really exist can appear in a record
-  (registries loaded from `books.txt` and `members.txt`)
-- the chain survives restarts (file-based persistence)
+- returning a book earns the member tokens (10 on time, 5 late, 0 if the
+  book is never returned)
+- no record reaches the chain until a miner confirms it with proof of work
+- member balances only change once that confirmation happens
+- balances can be kept in either of the two ledger designs used by real
+  blockchains: Bitcoin's UTXO model or Ethereum's account model
+- confirmation can be done by a solo miner, a mining pool or rented cloud
+  mining power
 
-This document goes through how each of those is implemented, the design
-decisions behind them, and what the system does and does not protect
-against.
+The registries, ECDSA signatures, passphrase-protected key and tamper
+detection from the base version are unchanged and are described in its
+[README](https://github.com/devark28/alu-blockchain-proj_1_assgmnt-library_lending/blob/main/q1_library_lending/README.md).
+This document covers what was added and why.
 
 ## Module overview
 
-The code is split by responsibility so each file can be read on its own:
-
 | File | Responsibility |
 |---|---|
-| `registry.c/h` | `Book`, `Member` and `Registry` structs; loading and validating `books.txt` and `members.txt`; lookup by ID |
-| `crypto.c/h` | thin wrappers over OpenSSL: SHA-256 to hex, key pair generation, reading and writing PEM key files, ECDSA sign and verify, hex encoding |
-| `blockchain.c/h` | `Block` and `Blockchain` structs; building, signing and hashing blocks; appending to and loading `chain.txt`; chain validation; deriving loan state |
-| `main.c` | the CLI: startup sequence, login and logout, borrow, return, overdue, view, validate and the tamper demo |
-| `utils.c/h` | small string helpers shared by the two file parsers |
+| `blockchain.c/h` | `Block` and the growable `BlockList`; signing, proof of work, validation, reading and writing block files |
+| `transaction.c/h` | the model-independent `Transaction`, transaction ids, `transactions.txt` |
+| `utxo.c/h` | UTXO set, input selection, change outputs, UTXO validation |
+| `account.c/h` | accounts with balance and nonce, history linked lists, account validation |
+| `ledger.c/h` | runs whichever model was chosen, replays the log, balances, history, double-spend test |
+| `library.c/h` | `LibrarySystem` state, startup, login, pending pool, confirming mined blocks, ledger cross-check |
+| `lending.c/h` | borrow, return with reward, mark overdue |
+| `mining.c/h` | solo, pool and cloud mining |
+| `main.c` | arguments, menu, views, transfers, tamper demo |
+| `registry.c/h`, `crypto.c/h`, `utils.c/h`, `input.c/h` | registries, OpenSSL wrappers, string and input helpers |
 
-The dependency direction is one way: `main.c` uses everything,
-`blockchain.c` uses `crypto.c` and the `Book`/`Member` structs, and
-`crypto.c` and `registry.c` know nothing about blocks. The crypto code
-could be swapped for another library without touching the chain logic.
+The dependencies run one way. `utxo.c` and `account.c` know only about
+`Transaction`; `ledger.c` chooses between them; `library.c` ties the
+chain, the pool and the ledger together; `mining.c` and `lending.c` use
+`library.c`; `main.c` uses everything. Neither ledger model knows that
+blocks exist.
 
-## Startup sequence
+## From lending to tokens
 
-```
-load books.txt and members.txt   -> exit with an error if either is missing or empty
-load or create the librarian keys
-load chain.txt                   -> exit if a line cannot be parsed
-create the genesis block         -> only if chain.txt had no blocks
-validate the whole chain         -> warn and block writes if it fails
-show the menu
-```
-
-Registries are loaded first because nothing else is meaningful without
-them. The chain is validated before the menu appears so a tampered
-`chain.txt` is reported immediately, not only when someone thinks to run
-option 6.
-
-## Registries
-
-`books.txt` and `members.txt` are read line by line into fixed arrays
-inside a `Registry` struct (`MAX_BOOKS` and `MAX_MEMBERS` are 200). The structs match the ones required.
-
-Each line goes through `parse_record()`, which accepts it only if:
-
-- it splits into exactly three comma-separated fields
-- no field is empty after trimming spaces
-- it does not contain `|`, which is the separator used in `chain.txt`
-  (a title containing `|` would otherwise corrupt the chain file)
-
-Each field is then copied with `copy_field()`, which refuses values that
-do not fit the struct's array instead of silently truncating them. A
-truncated ID could otherwise collide with another ID.
-
-Bad lines and duplicate IDs are skipped with a warning that includes the
-line number, so one typo does not stop the whole library. If a file is
-missing, or ends up with zero valid records, the program prints an error
-and exits:
+### The flow
 
 ```
-ERROR: cannot open books.txt (No such file or directory)
-ERROR: members.txt is empty or has no valid member records
+librarian: borrow / return / overdue
+        │  (registry lookup, loan state check, reward decided, record signed)
+        ▼
+pending.txt  ── records wait here, nothing is on the chain yet
+        │
+miner: solo / pool / cloud
+        │  (signature and reward checked, proof of work found)
+        ▼
+chain.txt  ── block confirmed
+        │
+reward transaction confirmed ──► transactions.txt ──► UTXO set or account balance
+        │
+mining reward paid to the miner(s)
 ```
 
-`find_book()` and `find_member()` are linear searches. With a few hundred
-records at most this is instant, and it keeps the code simple.
+### Rewards
 
-## Block structure
+When a book is returned, `return_book()` looks at the open loan:
+
+| Situation | `token_reward` | Transaction | Member receives |
+|---|---|---|---|
+| returned within the loan period | 10 | yes | 9 |
+| returned after the loan period, or after being marked OVERDUE | 5 | yes | 4 |
+| marked OVERDUE and not returned | 0 | none | nothing |
+| borrowed | 0 | none | nothing |
+
+The 1 coin fee is taken out of the reward before the member is credited.
+The fee is burned, not paid to anyone (see design choices).
+
+### The reward transaction is derived from the block
+
+The reward transaction is built entirely from fields the block already
+has:
+
+```
+type REWARD, sender LIBRARY, recipient = member_id,
+amount = token_reward - 1, fee = 1, reference = book_id, timestamp = block timestamp
+```
+
+Its id is the SHA-256 of those fields, and that id is stored in the
+block's `transaction_id`. Because nothing extra is needed, anyone holding
+the chain can rebuild the transaction and check it. The validator does
+exactly that for every block (the `reward` column), so the reward amount,
+the member and the transaction can never drift apart. Since
+`token_reward` and `transaction_id` are also covered by the librarian's
+signature, changing a reward means breaking the signature.
+
+### The pending pool
+
+Records are not appended to the chain when they are created. They are
+signed and written to `pending.txt`, and wait there until mined. This
+changes a few things compared to the base version:
+
+- **What the signature covers.** The librarian signs the lending data:
+  timestamp, book, member, action, `token_reward`, `transaction_id`. The
+  block's position (`index`, `previous_hash`) and the mining fields
+  (`difficulty`, `nonce`) are not known yet, so they are not signed. The
+  block hash covers all of it, including the signature.
+- **Book state includes pending records.** `find_open_loan()` checks the
+  pool before the chain, so a book that is borrowed but not yet mined
+  cannot be borrowed again, and a pending borrow can already be returned.
+- **Miners validate before mining.** `next_pending_is_valid()` checks the
+  signature and the reward of the first pending record. Anything invalid
+  (for example an edited `pending.txt`) is dropped instead of being mined
+  into the chain.
+
+### Confirmation
+
+`confirm_first_pending()` is the one place where a record becomes real:
+
+1. append the mined block to `chain.txt` and the in-memory chain
+2. remove it from the pool and rewrite `pending.txt`
+3. if it has a reward, submit the reward transaction to the ledger, which
+   validates it, writes it to `transactions.txt` and updates balances
+4. print the UTXO set or the account balances
+
+Only step 3 changes a balance, so a member is never credited for a record
+that is not on the chain.
+
+## Transaction models
+
+All confirmed transactions share one model-independent format:
 
 ```c
 typedef struct {
-    int index;
+    char txid[HASH_HEX_SIZE];
+    char type[TX_TYPE_SIZE];          /* REWARD, MINING or TRANSFER */
+    char sender[ACCOUNT_ID_SIZE];     /* LIBRARY, COINBASE or an account */
+    char recipient[ACCOUNT_ID_SIZE];
+    int amount;                       /* what the recipient receives */
+    int fee;                          /* paid on top by the sender */
+    int nonce;                        /* -1 for minted transactions */
+    char reference[REFERENCE_SIZE];
     time_t timestamp;
-    char book_id[20];
-    char book_title[80];
-    char member_id[20];
-    char member_name[50];
-    char action[ACTION_SIZE];                    /* 10 */
-    char previous_hash[HASH_HEX_SIZE];           /* 65 */
-    unsigned char signature[MAX_SIGNATURE_SIZE]; /* 72 */
-    unsigned int signature_len;
-    char hash[HASH_HEX_SIZE];                    /* 65 */
-} Block;
+} Transaction;
 ```
 
-The fields follow the required block layout, with two small notes:
+`LIBRARY` (lending rewards) and `COINBASE` (mining rewards) are minting
+senders: they create new coins, so they have no balance to check. Account
+IDs are member IDs from `members.txt`, plus miner IDs that appear when a
+miner is paid. Every member starts at 0 and only gains tokens from
+confirmed returns or transfers.
 
-- **`signature_len` was added.** An ECDSA signature is DER encoded, a
-  format whose length depends on the values of the two numbers inside it.
-  On `secp256k1` it is at most 72 bytes (which is why the
-  array is 72) and in practice varies between 70 and 72. Without storing the length,
-  verification would not know how many of the 72 bytes are the signature.
-  In a sample `chain.txt`, signatures start with `3044`, `3045` and
-  `3046`; the second byte is the length of what follows, so these are 70,
-  71 and 72 bytes long.
-- **`Member_name` is written as `member_name`** to match the naming of the
-  other fields.
+The ledger applies each transaction to the model chosen for the session.
+The log is the same for both, so the history can be opened as UTXOs in one
+session and as accounts in the next, with identical balances. This was
+tested by building a history in the UTXO model and reopening it in the
+account model.
 
-The book title and member name are copied into the block at the time of
-the transaction, as required. This means the chain is a self-contained
-historical record: if a member later changes their name in
-`members.txt`, old blocks still show the name that was valid at the time,
-and their signatures still verify.
+### UTXO model
 
-The genesis block has index 0, action `GENESIS`, empty book and member
-fields, and a `previous_hash` of 64 zeros. It is signed like every other
-block, so validation does not need a special case for it apart from the
-expected `previous_hash`.
+The ledger is a set of unspent outputs. Each `Utxo` records which
+transaction created it, its output index, its owner and its amount.
+Nobody has a stored balance: a balance is the sum of the outputs a person
+owns.
 
-The chain itself is a fixed array of `MAX_BLOCKS` (1000) blocks plus a
-count, following the array-based chain from class. The `LibrarySystem`
-struct that holds it is declared `static` so its roughly 400 KB live in
-the data segment instead of on the stack.
+**Minted transactions** have no inputs and one output.
 
-## Hashing and signing
+**A transfer** is built by `utxo_build_transaction()`:
 
-### What gets signed
+1. collect the sender's outputs, oldest first, until they cover
+   `amount + fee`
+2. if they never do, reject: insufficient funds
+3. output 0 pays the recipient `amount`
+4. if the inputs were more than `amount + fee`, output 1 returns the
+   excess to the sender as change
 
-`build_signing_payload()` joins the block's fields with `|`:
+The fee is the difference between inputs and outputs, so it simply
+disappears from the set.
+
+**Validation** (`utxo_validate()`) checks that every input is currently in
+the set, owned by the sender, and not used twice in the same transaction,
+and that inputs cover outputs plus the fee.
+
+**Double spending** is prevented because applying a transaction removes
+its inputs from the set. Any later transaction that names one of them
+fails the first check. Option 14 demonstrates this by re-submitting the
+last transfer with its original inputs:
 
 ```
-index|timestamp|book_id|book_title|member_id|member_name|action|previous_hash
+Re-submitting transfer 86ceaf26de954de2... (ALU001 -> ALU003, amount 5, nonce 0) under the UTXO model
+REJECTED: input f280c4a968f3...:0 is not in the UTXO set (already spent or never existed)
+Double spend prevented, nothing was changed.
 ```
 
-The separator matters. If the fields were simply concatenated, the pair
-`"AB" + "C"` and the pair `"A" + "BC"` would produce the same bytes, so two
-different blocks would have the same hash and the same valid signature.
-With a separator that cannot appear inside a field (the registry loader
-rejects `|`), each payload maps back to exactly one block.
+A transfer with change, from a real run (ALU001 had one 9 coin output
+and sent 5):
 
-`previous_hash` is part of the signed data, so a signature is bound to
-the block's position in the chain. A valid signed block cannot be cut
-out and pasted into a different place.
+```
+UTXO set, unspent outputs: 3
+  txid                 output owner            amount
+  ec3723d3ce85cc36...  0      MINER1           150
+  86ceaf26de954de2...  0      ALU003           5
+  86ceaf26de954de2...  1      ALU001           3
+```
 
-### Order: sign, then hash
+9 in, 5 to ALU003, 3 change back to ALU001, 1 fee burned. The full set is
+printed after every confirmed block and every transfer.
 
-`seal_block()` does two things in order:
+### Account model
 
-1. Sign the payload with the private key (ECDSA over SHA-256).
-2. Compute the block hash as SHA-256 of `payload|signature_hex`.
+Each `Account` holds an id, a balance, a nonce, and the head and tail of
+a linked list of `HistoryNode`s. The table of accounts is a growable
+array; members get an account at balance 0 when the session starts, and
+miners get one the first time they are paid.
 
-Because the hash includes the signature, changing or stripping the
-signature changes the hash, which breaks the link from the next block.
-The order is: create the block, sign it, then compute its hash.
+**Validation** (`account_validate()`) for a transfer:
 
-### Why ECDSA on secp256k1
+- the sender must exist
+- the transaction's nonce must equal the sender's next nonce; a lower one
+  is reported as reused, a higher one as incorrect
+- the balance must cover `amount + fee`
 
-Signatures use ECDSA with a 72-byte signature field. 72 bytes is
-the maximum DER signature size for 256-bit curves, and `secp256k1` is the
-curve used by Bitcoin and Ethereum for transaction signatures, so it is
-the natural choice for a blockchain project. OpenSSL 3's
-`EVP_EC_gen("secp256k1")` generates the key, and `EVP_DigestSign` /
-`EVP_DigestVerify` hash the payload with SHA-256 and sign or verify it in
-one call.
+**Applying** debits the sender `amount + fee`, increments the sender's
+nonce, credits the recipient, and appends the transaction to both
+accounts' history lists. Appending uses the tail pointer, so it is O(1)
+and the list stays in order.
 
-## Authentication and access control
+**The nonce** is what stops a replay in this model. There are no inputs
+to spend, so the same signed-off transfer could otherwise be applied
+twice. From a real run:
 
-There is one role that can write to the chain: the librarian. The
-librarian is authenticated by proving they can decrypt the private key.
+```
+REJECTED: incorrect nonce 5 for ALU003, the next nonce is 1
+REJECTED: nonce 1 was already used by ALU003, the next nonce is 2
+```
 
-- On first run, `create_librarian_keys()` generates the key pair and asks
-  for a passphrase (minimum 8 characters, entered twice). The private key
-  is written with `PEM_write_PrivateKey()` using AES-256-CBC, so the file
-  on disk is useless without the passphrase. The file is created with
-  `open(..., 0600)` so only the owner can read it, and `keys/` is created
-  with `0700`.
-- The public key is written unencrypted. Anyone can use it to verify
-  signatures, which is what makes the chain publicly checkable.
-- `require_login()` runs before any action that adds a block. It prompts
-  for the passphrase with terminal echo turned off, tries to decrypt the
-  private key, and allows 3 attempts. After decrypting, it checks with
-  `EVP_PKEY_eq()` that the private key matches the public key, so a
-  swapped key file is caught before it can sign anything.
-- Passphrase buffers are wiped with `OPENSSL_cleanse()` right after use,
-  so the passphrase does not linger in memory.
-- Option 8 logs out by freeing the private key, so it is no longer in
-  memory at all.
+**History** (option 13) walks the account's list:
 
-The resulting access control is:
+```
+Transaction history for ALU003 (balance 0, next nonce 2)
+  type      sender     recipient  amount  fee nonce  txid
+  TRANSFER  ALU001     ALU003          5    1     0  86ceaf26de954de2...
+  TRANSFER  ALU003     ALU005          2    1     0  2cde652ee7e4cdf2...
+  TRANSFER  ALU003     ALU005          1    1     1  9807d074657294b8...
+```
 
-| Action | Needs |
+In the UTXO model the same option filters the confirmed transaction list,
+since that model has no accounts to hang a list on.
+
+### Comparing the two models
+
+| | UTXO | Account |
+|---|---|---|
+| State | set of unspent outputs | one balance and nonce per account |
+| Balance | computed by summing outputs | read directly |
+| Double-spend protection | inputs are removed when spent | nonce must match exactly |
+| Change | explicit change output | not needed, balance is debited |
+| Fee | inputs minus outputs | debited with the amount |
+| History | derived from transactions | linked list per account |
+| Parallel validation | transactions with different inputs are independent | transactions from one sender must be ordered by nonce |
+| Privacy | owner can use a new output each time | one visible account |
+| Cost of a balance lookup | O(outputs) | O(accounts) to find it, then O(1) |
+
+The UTXO model needs more bookkeeping (input selection, change) but its
+rules are local: whether a transaction is valid depends only on the
+outputs it spends. The account model is simpler to read and cheaper for
+balances, but every transfer from one account depends on all earlier
+ones through the nonce.
+
+## Mining
+
+### Proof of work
+
+`search_nonce()` is the core loop:
+
+```
+compute the block hash
+if it starts with `difficulty` zero hex characters: done
+otherwise increment nonce and try again
+```
+
+It takes a maximum number of attempts, so the same function serves solo
+mining (no limit) and pool or cloud mining (a fixed number per round).
+
+`difficulty` (1 to 4, default 2) is stored in each block, so validation
+always checks a block against the difficulty it was mined at, even if the
+setting changes later. Each extra zero multiplies the expected work by
+16:
+
+| Difficulty | Expected attempts |
 |---|---|
-| View registries, view records, validate, tamper demo | public key only |
-| Borrow, return, mark overdue, create genesis | private key (passphrase) |
+| 1 | 16 |
+| 2 | 256 |
+| 3 | 4,096 |
+| 4 | 65,536 |
 
-This reflects how a real blockchain works: anyone can read and verify,
-only key holders can write.
+The hash covers `index | difficulty | nonce | previous_hash | signed data
+| signature`. Changing anything, including the nonce, gives a completely
+different hash, which is why there is no shortcut to searching.
 
-## Lending rules
+### Solo mining
 
-A book's current state is never stored as a field that can be edited. It
-is derived from the chain by `find_open_loan()`, which walks backwards
-from the newest block to the latest block for that book:
+One miner takes every pending record in order, verifies it, places it on
+top of the chain and searches nonces until the hash meets the
+difficulty. It prints the nonce, the attempts and the time for each
+block. The miner is paid `50 x blocks` through a `MINING` transaction
+from `COINBASE`, separate from the members' reward transactions.
 
-- latest is `BORROWED` or `OVERDUE`: the book is on loan, and that block
-  says to whom
-- latest is `RETURNED`, or there is no block for the book: it is available
+### Pool mining
 
-The three actions use this:
+Four miners get random hash rates between 50 and 300 attempts per round.
+Each round is split into 10 time slices, and in each slice every miner
+tries a tenth of its hash rate. This approximates miners working in
+parallel: a faster miner does proportionally more work, and no miner
+always gets the first try. All miners continue one shared nonce sequence,
+the way a pool hands out non-overlapping work.
 
-**Borrow** (option 2). Look up both IDs; if either is unknown, print
-`ERROR: Book or Member not found` and stop. If the book already has an
-open loan, refuse and name the current borrower. Otherwise create a
-`BORROWED` block.
-
-**Return** (option 3). Look up both IDs. If the book has no open loan
-(never borrowed, or already returned), print an error. If it is on loan
-to a different member, refuse; this stops someone recording a return on
-another member's behalf. Otherwise create a `RETURNED` block.
-
-**Mark overdue** (option 4). Only the book ID is asked for; the member
-is taken from the open loan. The action is refused if the book is not on
-loan, is already marked overdue, or its loan period has not passed yet
-(14 days after the `BORROWED` block's timestamp). The period can be
-shortened for a demo with `-DLOAN_PERIOD_SECONDS=60`. An overdue book can
-still be returned normally.
-
-None of the three ever modifies an existing block. A return does not
-"close" the borrow block; it adds a new one. The full history of every
-book is always on the chain.
-
-## Persistence
-
-The chain is stored in `chain.txt`, one block per line, fields separated
-by `|`, the signature as hex:
+When the pool has confirmed every pending block, rewards are shared:
 
 ```
-index|timestamp|book_id|book_title|member_id|member_name|action|previous_hash|signature_hex|hash
+gross reward   = 50 x blocks
+pool fee       = 2% of gross            -> POOL-OPERATOR
+miner reward_i = (attempts_i / total_attempts) x (gross - pool fee)
 ```
 
-Design choices:
-
-- **Plain text instead of `fwrite` of the struct.** A binary dump would
-  depend on struct padding and `time_t` size, so it would not be portable
-  between compilers or machines. Text also means tampering can be shown
-  in the video with a normal text editor.
-- **Append only.** `append_block()` opens the file in `"a"` mode and adds
-  one line. Existing lines are never rewritten, which mirrors how a
-  blockchain grows.
-- **Write before commit.** The new block is written to disk first and
-  only added to the in-memory array if the write and `fclose()` both
-  succeed. A failed write therefore never leaves the program showing a
-  record that was not saved.
-- **Strict loading.** `load_chain()` parses every field and refuses to
-  start if a line is malformed (wrong field count, non-numeric index,
-  invalid hex signature, a field too long for its array), reporting the
-  line number. It does not try to repair the file: a chain that cannot
-  be parsed cannot be trusted.
-
-The keys are persisted in `keys/` as PEM files, the standard format that
-the `openssl` command line tool can also read:
+Coins are whole numbers, so each share is rounded down and the remainder
+(at most a few coins) goes to the miner with the most attempts. From a
+real run:
 
 ```
-openssl pkey -in keys/librarian_private.pem -noout -text   # asks for the passphrase
-openssl pkey -pubin -in keys/librarian_public.pem -noout -text
+Pool reward sharing: 2 blocks x 50 = 100 coins, pool fee 2% = 2, shared 98
+  miner      hash rate   attempts    share  blocks  reward
+  POOL-M1          100         57   16.52%       1      16
+  POOL-M2           50         25    7.25%       0       7
+  POOL-M3          250        125   36.23%       0      35
+  POOL-M4          300        138   40.00%       1      40
+  total                       345  100.00%       2      98
 ```
 
-## Chain validation
+POOL-M3 found no block but earned 35 coins, because rewards follow work
+done, not luck. That is the point of a pool: members get a steady income
+proportional to their hash rate instead of rare large payouts.
 
-`validate_chain()` checks four things on every block:
+### Cloud mining
+
+A member rents 300 attempts per round for 1 to 5 rounds:
+
+- each round costs a rental fee of 20 coins
+- when the rented power finds a block, the 50 coin reward minus a 10%
+  maintenance fee is credited to the member through the ledger
+- an unfinished block carries over to the next round
+- once the pool is empty, the remaining rounds are idle but still paid
+
+After every round it prints cumulative rewards and fees, and warns as soon
+as fees exceed rewards. The summary shows gross earnings, total fees and
+net profit. Two real runs show what drives profit:
+
+```
+difficulty 2, 5 rounds, 2 pending records
+  Gross earnings   100 coins
+  Total fees       110 coins (rental 100 + maintenance 10)
+  Net profit       -10 coins
+
+difficulty 3, 3 rounds, 1 pending record
+  Gross earnings   0 coins
+  Total fees       60 coins (rental 60 + maintenance 0)
+  Net profit       -60 coins
+```
+
+At difficulty 2 a block needs about 256 attempts, so 300 per round
+usually finds one, and the rental pays while there is work; renting more
+rounds than there are pending blocks loses money. At difficulty 3 a block
+needs about 4,096 attempts, so 300 per round almost never succeeds. This
+is the real economics of cloud mining: the contract price is fixed, the
+reward depends on difficulty.
+
+## Validation and integrity
+
+`validate_chain()` now checks six things per block:
 
 | Check | Catches |
 |---|---|
-| `index` equals the position in the array | blocks deleted, inserted or reordered |
-| stored `hash` equals a freshly computed hash | any edit to any field of that block |
-| `previous_hash` equals the previous block's `hash` (64 zeros for block 0) | a block replaced or removed, a broken link |
-| signature verifies with the librarian's public key | edits followed by rehashing, blocks forged without the key |
+| index matches position | removed, inserted or reordered blocks |
+| hash matches recomputed hash | any edit to any field |
+| `previous_hash` matches the previous block | broken links |
+| proof of work: recomputed hash meets the block's difficulty | blocks that were never mined, or edited after mining |
+| signature verifies | edits to the lending data, forged records |
+| reward matches transaction | a reward or transaction id that does not belong to the block |
 
-The first three are the two checks asked for plus an index
-check; the fourth is what makes the chain resist a determined attacker,
-as the next section shows.
+On top of that, `library_is_consistent()` checks that every reward on the
+chain is confirmed in `transactions.txt` with the same member and amount,
+and `load_transactions()` recomputes every transaction id, so an edited
+amount in the log is refused at startup. Writing records and mining are
+blocked while anything fails.
 
-The printed report shows the result of each check per block, the stored
-and recomputed hashes when they differ, and names the first tampered
-block. The same function runs silently at startup and before every write.
+### Tamper demo
 
-## Tamper detection, analysed
-
-Option 7 runs a two-step attack on a copy of the chain in memory
-(`chain.txt` is not modified):
-
-**Step 1: naive edit.** The chosen block's action is flipped, for
-example `BORROWED` to `RETURNED` (the "quietly mark a lost book as
-returned" scenario). Validation shows:
-
-```
-Block 1    index OK    hash FAIL  link OK    signature FAIL  <-- TAMPERED
-           stored hash     d50ce94449cfc54caf370eed7d9caa4e36090f2ceef69e7d4e72aef70635aedf
-           recomputed hash 044a316544f6d139b66314d4e808070a94366a64c5c67bda01d51eae2780be40
-Block 2    index OK    hash OK    link OK    signature OK
-```
-
-The stored hash no longer matches the data. Changing one field changed
-the entire hash (the avalanche property of SHA-256).
-
-**Step 2: the attacker rehashes.** A smarter attacker recomputes the hash
-of the edited block and every block after it, updating each
-`previous_hash` so the links line up. This is cheap: SHA-256 takes
-microseconds, and there is no proof of work in this project. Validation
-now shows:
+Option 16 attacks a copy of the chain. Step 1 raises a returned book's
+reward from 10 to 100: hash, proof of work, signature and reward checks
+all fail on that block. Step 2 does everything an attacker can do without
+the key: rebuild the reward transaction id, then redo the proof of work
+for that block and every block after it.
 
 ```
-Block 1    index OK    hash OK    link OK    signature FAIL  <-- TAMPERED
-Block 2    index OK    hash OK    link OK    signature FAIL  <-- TAMPERED
-Block 3    index OK    hash OK    link OK    signature FAIL  <-- TAMPERED
+Re-mined 8 blocks in 1719 hash attempts.
+Block 3   index OK   hash OK   link OK   pow OK   signature FAIL reward OK   <-- TAMPERED
 ```
 
-Every hash and link is consistent again, so the hash and link checks
-would both pass. Only the signatures catch it: block 1's signed
-data changed, and blocks 2 and 3 now have a different `previous_hash`
-from the one that was signed. Making them valid again would need the
-librarian's private key.
+Proof of work makes rewriting history cost work proportional to the
+difficulty and to the number of later blocks; on a real network that cost
+is enormous. Here it is cheap, which is why the signature is still the
+check that holds.
 
-This is the key takeaway of the project: **hash linking alone makes
-tampering visible only if someone kept the original hashes. Signatures
-make it detectable from the chain alone.**
+## Design choices and assumptions
 
-A manual edit of `chain.txt` behaves like step 1, and is caught at
-startup:
+- **Fees are burned.** The 1 coin fee leaves circulation instead of going
+  to a miner, as with Ethereum's base fee since EIP-1559. Miners are paid
+  only by block rewards, which keeps the three mining methods comparable.
+- **Transfers are confirmed immediately.** A lending block carries one
+  lending record, so manual transfers are validated and applied at once
+  rather than waiting in the pool. Lending records always go through
+  mining.
+- **Transfers are authorised by the librarian.** Members have no keys of
+  their own, so a transfer requires librarian login, the same as lending
+  actions.
+- **Minted transactions have no nonce.** Like Bitcoin's coinbase, a
+  reward or mining payout is not sent by an account, so nonce rules apply
+  only to transfers.
+- **Whole coins.** All amounts are integers to avoid floating-point
+  rounding in balances. Pool shares round down and the remainder goes to
+  the biggest contributor.
+- **Cloud rental fees are paid outside the ledger.** The rented reward is
+  credited on-chain minus maintenance; the per-round rental fee is a
+  payment to the provider, counted only in the profit calculation.
+- **Mining reward is 50 coins per block** for all three methods, so their
+  results can be compared directly.
+- **Miners do not need the librarian key.** They only verify signatures
+  with the public key, so confirming records is separate from creating
+  them.
+- **One difficulty per block.** The difficulty used is stored in the block
+  so changing the setting never invalidates earlier blocks.
 
-```
-WARNING: chain.txt failed validation. Use option 6 for details. New records are blocked.
-```
+## Memory management
 
-Blocking writes on an invalid chain matters: appending a new block to a
-tampered chain would link a legitimate record to forged history.
+Everything that grows is allocated dynamically and freed at exit:
 
-## Error handling
-
-The strategy is: validate every input at the boundary where it enters
-the program, report exactly what is wrong, and never leave the chain or
-its file in a half-written state.
-
-| Situation | Behaviour |
+| Structure | Storage |
 |---|---|
-| `books.txt` or `members.txt` missing | error with the OS reason, exit |
-| registry file empty or no valid lines | error, exit |
-| malformed, too long or duplicate registry line | warning with line number, line skipped |
-| unknown book or member ID | `ERROR: Book or Member not found`, nothing recorded |
-| borrowing a book already on loan | error naming the current borrower |
-| returning a book not on loan, or by the wrong member | error, nothing recorded |
-| marking overdue too early | error showing the due date |
-| wrong passphrase | 3 attempts, then the action is cancelled |
-| private key does not match public key | error, login refused |
-| `chain.txt` line cannot be parsed | error with line number, exit |
-| chain fails validation | warning at startup, all writes refused |
-| writing `chain.txt` fails | error, block not added to memory |
-| chain full (1000 blocks) | error, nothing recorded |
-| input longer than the buffer | rest of the line discarded, so it cannot spill into the next prompt |
-| end of input (Ctrl+D) | clean exit |
+| chain and pending pool | `BlockList`, array grown with `realloc` (doubling) |
+| confirmed transactions | `TransactionList`, same pattern |
+| UTXO set | `UtxoSet`, same pattern, spent outputs removed with `memmove` |
+| accounts | `AccountTable`, same pattern |
+| account history | singly linked list per account, `malloc` per node, freed node by node |
 
-All OpenSSL calls have their return values checked, and every key and
-context is freed. The program was also run under AddressSanitizer and
-UndefinedBehaviorSanitizer through a full session with no reports.
+A full session (borrow, return, overdue, all three mining methods,
+transfers, replay test, validation, tamper demo) was run under
+AddressSanitizer and UndefinedBehaviorSanitizer with no errors and no
+leaks reported.
 
-## Limitations
+## Edge case results
 
-Being honest about what this design does not cover:
-
-- **The public key is the trust anchor.** Someone with write access to
-  the folder could generate their own key pair, replace
-  `librarian_public.pem`, and re-sign a forged chain. Real systems solve
-  this by publishing the public key (or its fingerprint) somewhere the
-  attacker cannot change, or by having many independent nodes hold the
-  chain.
-- **Single node, no consensus.** There is one copy of the chain. Deleting
-  the last few lines of `chain.txt` produces a shorter chain that is still
-  valid. A distributed blockchain prevents this because other nodes still
-  hold the longer chain.
-- **One signer.** All blocks are signed by the librarian. Having the
-  borrower also sign would prove the member agreed to the record, which
-  would settle the "borrower disputes the log" case.
+| Case | Result |
+|---|---|
+| unknown member `ALU999` | `ERROR: Book or Member not found`, nothing queued |
+| book marked overdue and not returned | OVERDUE block mined with reward 0 and no transaction id |
+| late return | reward 5, member credited 4 |
+| transfer of 10 with a balance of 3 | `REJECTED: insufficient funds, ALU001 has 3 coins in unspent outputs but needs 11 (10 + 1 fee)` |
+| account transfer with nonce 5, expected 1 | `REJECTED: incorrect nonce 5 for ALU003, the next nonce is 1` |
+| replaying the last transfer | UTXO: input already spent; account: nonce already used |
+| 5 round rental with 2 pending blocks | warning at round 5, net profit -10 |
+| 3 round rental at difficulty 3 | warning every round, net profit -60 |
+| edited amount in `transactions.txt` | refused at startup, txid does not match contents |
+| edited name in `chain.txt` | startup warning, block named as tampered, writes and mining blocked |
+| edited record in `pending.txt` | shown with INVALID signature, dropped by the miner |

@@ -1,329 +1,70 @@
 #include "blockchain.h"
-#include "crypto.h"
-#include "registry.h"
-#include "utils.h"
+#include "input.h"
+#include "ledger.h"
+#include "lending.h"
+#include "library.h"
+#include "mining.h"
+#include "transaction.h"
 
-#include <errno.h>
-#include <openssl/crypto.h>
+#include <limits.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <sys/stat.h>
-#include <termios.h>
-#include <unistd.h>
+#include <time.h>
 
-#define BOOKS_FILE "books.txt"
-#define MEMBERS_FILE "members.txt"
-#define CHAIN_FILE "chain.txt"
-#define KEYS_DIR "keys"
-#define PRIVATE_KEY_FILE KEYS_DIR "/librarian_private.pem"
-#define PUBLIC_KEY_FILE KEYS_DIR "/librarian_public.pem"
+#define ID_INPUT_SIZE 64
+#define MAX_TRANSFER_AMOUNT 1000000
+#define TAMPERED_REWARD 100
 
-#define INPUT_SIZE 64
-#define PASSPHRASE_SIZE 128
-#define MIN_PASSPHRASE_LENGTH 8
-#define MAX_LOGIN_ATTEMPTS 3
-
-#ifndef LOAN_PERIOD_SECONDS
-#define LOAN_PERIOD_SECONDS (14 * 24 * 60 * 60)
-#endif
-
-typedef struct {
-    Registry registry;
-    Blockchain chain;
-    EVP_PKEY *public_key;
-    EVP_PKEY *private_key;
-} LibrarySystem;
-
-static bool read_line(char *buffer, size_t size)
+static void print_usage(const char *program)
 {
-    if (fgets(buffer, (int)size, stdin) == NULL) {
-        buffer[0] = '\0';
-        return false;
-    }
-
-    size_t length = strcspn(buffer, "\n");
-    if (buffer[length] != '\n') {
-        int extra;
-        while ((extra = getchar()) != '\n' && extra != EOF) {
-        }
-    }
-    buffer[length] = '\0';
-    trim_whitespace(buffer);
-    return true;
+    printf("Usage: %s [--model utxo|account] [--difficulty %d-%d]\n", program, MIN_DIFFICULTY, MAX_DIFFICULTY);
+    printf("Without --model the program asks which model to use.\n");
 }
 
-static void prompt(const char *label, char *buffer, size_t size)
+/* Returns false on an unknown or malformed argument. */
+static bool parse_arguments(int argc, char *argv[], bool *model_given, LedgerModel *model, int *difficulty)
 {
-    printf("%s", label);
-    fflush(stdout);
-    read_line(buffer, size);
-}
-
-/* Turns terminal echo off while the passphrase is typed. */
-static void prompt_passphrase(const char *label, char *buffer, size_t size)
-{
-    struct termios original_settings;
-    bool is_terminal = tcgetattr(STDIN_FILENO, &original_settings) == 0;
-
-    if (is_terminal) {
-        struct termios hidden_settings = original_settings;
-        hidden_settings.c_lflag &= ~(tcflag_t)ECHO;
-        tcsetattr(STDIN_FILENO, TCSANOW, &hidden_settings);
-    }
-
-    prompt(label, buffer, size);
-
-    if (is_terminal) {
-        tcsetattr(STDIN_FILENO, TCSANOW, &original_settings);
-        printf("\n");
-    }
-}
-
-static bool choose_new_passphrase(char *passphrase, size_t size)
-{
-    char confirmation[PASSPHRASE_SIZE];
-
-    for (;;) {
-        prompt_passphrase("New librarian passphrase: ", passphrase, size);
-        if (strlen(passphrase) < MIN_PASSPHRASE_LENGTH) {
-            printf("The passphrase must be at least %d characters.\n", MIN_PASSPHRASE_LENGTH);
-            if (feof(stdin)) {
+    for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "--model") == 0 && i + 1 < argc) {
+            i++;
+            if (strcmp(argv[i], "utxo") == 0) {
+                *model = MODEL_UTXO;
+            } else if (strcmp(argv[i], "account") == 0) {
+                *model = MODEL_ACCOUNT;
+            } else {
                 return false;
             }
-            continue;
-        }
-        prompt_passphrase("Confirm passphrase: ", confirmation, sizeof(confirmation));
-        bool matches = strcmp(passphrase, confirmation) == 0;
-        OPENSSL_cleanse(confirmation, sizeof(confirmation));
-        if (matches) {
-            return true;
-        }
-        printf("The passphrases do not match, try again.\n");
-        if (feof(stdin)) {
+            *model_given = true;
+        } else if (strcmp(argv[i], "--difficulty") == 0 && i + 1 < argc) {
+            i++;
+            char *end;
+            long value = strtol(argv[i], &end, 10);
+            if (*end != '\0' || value < MIN_DIFFICULTY || value > MAX_DIFFICULTY) {
+                return false;
+            }
+            *difficulty = (int)value;
+        } else {
             return false;
         }
-    }
-}
-
-/*
- * First run: create the librarian's key pair. The new private key stays
- * loaded, so the librarian is logged in and can sign the genesis block.
- */
-static bool create_librarian_keys(LibrarySystem *library)
-{
-    printf("No librarian keys found. Creating a new %s key pair.\n", SIGNATURE_CURVE);
-
-    if (mkdir(KEYS_DIR, 0700) != 0 && errno != EEXIST) {
-        fprintf(stderr, "ERROR: cannot create %s/ (%s)\n", KEYS_DIR, strerror(errno));
-        return false;
-    }
-
-    char passphrase[PASSPHRASE_SIZE];
-    if (!choose_new_passphrase(passphrase, sizeof(passphrase))) {
-        fprintf(stderr, "ERROR: no passphrase was set\n");
-        return false;
-    }
-
-    EVP_PKEY *key = generate_key_pair();
-    bool saved = key != NULL && save_key_pair(key, PRIVATE_KEY_FILE, PUBLIC_KEY_FILE, passphrase);
-    OPENSSL_cleanse(passphrase, sizeof(passphrase));
-    if (!saved) {
-        EVP_PKEY_free(key);
-        return false;
-    }
-
-    library->private_key = key;
-    library->public_key = load_public_key(PUBLIC_KEY_FILE);
-    if (library->public_key == NULL) {
-        return false;
-    }
-    printf("Keys saved to %s/. The private key is encrypted with your passphrase.\n", KEYS_DIR);
-    return true;
-}
-
-static bool setup_keys(LibrarySystem *library)
-{
-    if (access(PUBLIC_KEY_FILE, F_OK) != 0) {
-        return create_librarian_keys(library);
-    }
-    library->public_key = load_public_key(PUBLIC_KEY_FILE);
-    return library->public_key != NULL;
-}
-
-/*
- * Read-only actions need only the public key. Actions that add a block need
- * the private key, and the only way to get it is to decrypt it with the
- * librarian's passphrase.
- */
-static bool require_login(LibrarySystem *library)
-{
-    if (library->private_key != NULL) {
-        return true;
-    }
-    printf("This action adds a signed block and requires librarian login.\n");
-
-    for (int attempt = 1; attempt <= MAX_LOGIN_ATTEMPTS; attempt++) {
-        char passphrase[PASSPHRASE_SIZE];
-        prompt_passphrase("Librarian passphrase: ", passphrase, sizeof(passphrase));
-        EVP_PKEY *key = load_private_key(PRIVATE_KEY_FILE, passphrase);
-        OPENSSL_cleanse(passphrase, sizeof(passphrase));
-
-        if (key != NULL && EVP_PKEY_eq(key, library->public_key) == 1) {
-            library->private_key = key;
-            printf("Login successful.\n");
-            return true;
-        }
-        if (key != NULL) {
-            EVP_PKEY_free(key);
-            printf("ERROR: %s does not match %s\n", PRIVATE_KEY_FILE, PUBLIC_KEY_FILE);
-            return false;
-        }
-        printf("Wrong passphrase (attempt %d of %d).\n", attempt, MAX_LOGIN_ATTEMPTS);
-        if (feof(stdin)) {
-            break;
-        }
-    }
-    printf("ERROR: login failed, action cancelled.\n");
-    return false;
-}
-
-static void logout(LibrarySystem *library)
-{
-    if (library->private_key == NULL) {
-        printf("You are not logged in.\n");
-        return;
-    }
-    EVP_PKEY_free(library->private_key);
-    library->private_key = NULL;
-    printf("Logged out. The private key has been removed from memory.\n");
-}
-
-static bool create_chain_if_missing(LibrarySystem *library)
-{
-    if (library->chain.count > 0) {
-        return true;
-    }
-    printf("No chain found in %s, creating the genesis block.\n", CHAIN_FILE);
-    if (!require_login(library)) {
-        return false;
-    }
-
-    Block genesis;
-    return create_genesis_block(&genesis, library->private_key)
-        && append_block(&library->chain, &genesis, CHAIN_FILE);
-}
-
-static void record_action(LibrarySystem *library, const Book *book, const Member *member, const char *action)
-{
-    if (!validate_chain(&library->chain, library->public_key, false)) {
-        printf("ERROR: the chain failed validation, new records are blocked until it is restored.\n");
-        return;
-    }
-
-    Block new_block;
-    if (!create_block(&library->chain, book, member, action, library->private_key, &new_block)
-        || !append_block(&library->chain, &new_block, CHAIN_FILE)) {
-        printf("ERROR: the record was not saved.\n");
-        return;
-    }
-    printf("Block %d added: %s %s (%s) by %s (%s)\n", new_block.index, action,
-           book->book_id, book->title, member->member_id, member->full_name);
-    printf("Hash %s\n", new_block.hash);
-}
-
-static bool lookup_book_and_member(const LibrarySystem *library, const Book **book, const Member **member)
-{
-    char book_id[INPUT_SIZE];
-    char member_id[INPUT_SIZE];
-    prompt("Book ID: ", book_id, sizeof(book_id));
-    prompt("Member ID: ", member_id, sizeof(member_id));
-
-    *book = find_book(&library->registry, book_id);
-    *member = find_member(&library->registry, member_id);
-    if (*book == NULL || *member == NULL) {
-        printf("ERROR: Book or Member not found\n");
-        return false;
     }
     return true;
 }
 
-static void borrow_book(LibrarySystem *library)
+static bool choose_model(LedgerModel *model)
 {
-    const Book *book;
-    const Member *member;
-    if (!require_login(library) || !lookup_book_and_member(library, &book, &member)) {
-        return;
-    }
+    printf("Choose the transaction model for this session:\n");
+    printf("  1. UTXO (unspent transaction outputs)\n");
+    printf("  2. Account-based (balances and nonces)\n");
 
-    const Block *open_loan = find_open_loan(&library->chain, book->book_id);
-    if (open_loan != NULL) {
-        printf("ERROR: %s is already on loan to %s (%s) since block %d\n",
-               book->book_id, open_loan->member_id, open_loan->member_name, open_loan->index);
-        return;
+    int choice;
+    while (!prompt_number("Model: ", 1, 2, &choice)) {
+        if (feof(stdin)) {
+            return false;
+        }
     }
-    record_action(library, book, member, ACTION_BORROWED);
-}
-
-static void return_book(LibrarySystem *library)
-{
-    const Book *book;
-    const Member *member;
-    if (!require_login(library) || !lookup_book_and_member(library, &book, &member)) {
-        return;
-    }
-
-    const Block *open_loan = find_open_loan(&library->chain, book->book_id);
-    if (open_loan == NULL) {
-        printf("ERROR: %s has no open BORROWED record (never borrowed or already returned)\n", book->book_id);
-        return;
-    }
-    if (strcmp(open_loan->member_id, member->member_id) != 0) {
-        printf("ERROR: %s is on loan to %s (%s), not %s\n",
-               book->book_id, open_loan->member_id, open_loan->member_name, member->member_id);
-        return;
-    }
-    record_action(library, book, member, ACTION_RETURNED);
-}
-
-static void mark_overdue(LibrarySystem *library)
-{
-    if (!require_login(library)) {
-        return;
-    }
-
-    char book_id[INPUT_SIZE];
-    prompt("Book ID: ", book_id, sizeof(book_id));
-    const Book *book = find_book(&library->registry, book_id);
-    if (book == NULL) {
-        printf("ERROR: Book or Member not found\n");
-        return;
-    }
-
-    const Block *open_loan = find_open_loan(&library->chain, book->book_id);
-    if (open_loan == NULL) {
-        printf("ERROR: %s is not on loan\n", book->book_id);
-        return;
-    }
-    if (strcmp(open_loan->action, ACTION_OVERDUE) == 0) {
-        printf("ERROR: %s is already marked overdue in block %d\n", book->book_id, open_loan->index);
-        return;
-    }
-
-    time_t due_time = open_loan->timestamp + LOAN_PERIOD_SECONDS;
-    if (time(NULL) < due_time) {
-        char due_text[32];
-        format_timestamp(due_time, due_text, sizeof(due_text));
-        printf("ERROR: %s is not overdue yet, it is due on %s\n", book->book_id, due_text);
-        return;
-    }
-
-    const Member *member = find_member(&library->registry, open_loan->member_id);
-    if (member == NULL) {
-        printf("ERROR: Book or Member not found\n");
-        return;
-    }
-    record_action(library, book, member, ACTION_OVERDUE);
+    *model = choice == 1 ? MODEL_UTXO : MODEL_ACCOUNT;
+    return true;
 }
 
 static void view_registries(const LibrarySystem *library)
@@ -333,12 +74,13 @@ static void view_registries(const LibrarySystem *library)
     printf("\nBooks (%d)\n", registry->book_count);
     for (int i = 0; i < registry->book_count; i++) {
         const Book *book = &registry->books[i];
-        const Block *open_loan = find_open_loan(&library->chain, book->book_id);
+        bool is_pending;
+        const Block *open_loan = find_open_loan(library, book->book_id, &is_pending);
         printf("  %-8s %-28s %-26s ", book->book_id, book->title, book->author);
         if (open_loan == NULL) {
             printf("available\n");
         } else {
-            printf("%s by %s\n", open_loan->action, open_loan->member_id);
+            printf("%s by %s%s\n", open_loan->action, open_loan->member_id, is_pending ? " (pending)" : "");
         }
     }
 
@@ -349,134 +91,278 @@ static void view_registries(const LibrarySystem *library)
     }
 }
 
+static void view_pending_pool(const LibrarySystem *library)
+{
+    printf("\nPending pool, unconfirmed records: %d (signed, not yet on the chain)\n", library->pending.count);
+    for (int i = 0; i < library->pending.count; i++) {
+        print_pending_record(&library->pending.blocks[i], library->public_key);
+    }
+    if (library->pending.count > 0) {
+        printf("Mine them with option 6, 7 or 8 to confirm them and credit any rewards.\n");
+    }
+}
+
 static void view_records(const LibrarySystem *library)
 {
     printf("\n");
     for (int i = 0; i < library->chain.count; i++) {
         print_block(&library->chain.blocks[i], library->public_key);
     }
-    printf("%d blocks in the chain.\n", library->chain.count);
+    printf("%d confirmed blocks in the chain.\n", library->chain.count);
+}
+
+static void view_balances(const LibrarySystem *library)
+{
+    printf("\n%s model\n", model_name(library->ledger.model));
+    ledger_print_state(&library->ledger, &library->registry);
+}
+
+static bool is_known_account(const LibrarySystem *library, const char *id)
+{
+    return find_member(&library->registry, id) != NULL || ledger_has_account(&library->ledger, id);
 }
 
 /*
- * Works on a copy of the chain, so chain.txt and the real chain are never
- * touched. Step 1 edits a block the naive way. Step 2 repeats what a smarter
- * attacker would do: recompute every hash from the edited block onwards so
- * the links line up again. Only the signature check can catch step 2.
+ * A manual transfer between two accounts, confirmed immediately. The UTXO
+ * model picks the inputs and the nonce itself; the account model asks for
+ * the nonce so that a wrong or reused one can be shown being rejected.
+ */
+static void transfer_tokens(LibrarySystem *library)
+{
+    if (!require_login(library)) {
+        return;
+    }
+
+    char sender[ID_INPUT_SIZE];
+    char recipient[ID_INPUT_SIZE];
+    prompt_text("Sender ID: ", sender, sizeof(sender));
+    prompt_text("Recipient ID: ", recipient, sizeof(recipient));
+    if (!is_known_account(library, sender) || !is_known_account(library, recipient)) {
+        printf("ERROR: unknown account, use a member ID or a miner that has received coins\n");
+        return;
+    }
+    if (strcmp(sender, recipient) == 0) {
+        printf("ERROR: sender and recipient must be different\n");
+        return;
+    }
+
+    int amount;
+    if (!prompt_number("Amount: ", 1, MAX_TRANSFER_AMOUNT, &amount)) {
+        return;
+    }
+
+    int nonce;
+    if (library->ledger.model == MODEL_ACCOUNT) {
+        if (!prompt_number("Nonce: ", 0, INT_MAX, &nonce)) {
+            return;
+        }
+    } else {
+        nonce = ledger_next_nonce(&library->ledger, sender);
+    }
+
+    Transaction tx;
+    make_transaction(&tx, TX_TRANSFER, sender, recipient, amount, TRANSACTION_FEE, nonce, "", time(NULL));
+    if (!ledger_submit(&library->ledger, &tx, TRANSACTIONS_FILE)) {
+        return;
+    }
+
+    printf("Transfer %.16s... confirmed: %s -> %s, amount %d, fee %d, nonce %d\n",
+           tx.txid, sender, recipient, amount, tx.fee, nonce);
+    if (library->ledger.model == MODEL_UTXO) {
+        const UtxoTransaction *spent = &library->ledger.last_utxo_transfer;
+        printf("Inputs spent: %d, outputs created: %d%s\n", spent->input_count, spent->output_count,
+               spent->output_count > 1 ? " (including change back to the sender)" : "");
+    }
+    view_balances(library);
+}
+
+static void show_history(const LibrarySystem *library)
+{
+    char id[ID_INPUT_SIZE];
+    prompt_text("Member or miner ID: ", id, sizeof(id));
+    printf("\n");
+    ledger_print_history(&library->ledger, id);
+}
+
+static void set_difficulty(LibrarySystem *library)
+{
+    int difficulty;
+    printf("Current difficulty: %d. Each extra zero makes a valid hash about 16 times harder to find.\n",
+           library->difficulty);
+    if (prompt_number("New difficulty (1-4): ", MIN_DIFFICULTY, MAX_DIFFICULTY, &difficulty)) {
+        library->difficulty = difficulty;
+        printf("Difficulty set to %d: about %d hash attempts per block on average.\n",
+               difficulty, 1 << (4 * difficulty));
+    }
+}
+
+static void solo_mining(LibrarySystem *library)
+{
+    char miner_id[ID_INPUT_SIZE];
+    prompt_text("Miner ID (e.g. MINER1): ", miner_id, sizeof(miner_id));
+    if (!is_valid_account_id(miner_id)) {
+        printf("ERROR: a miner ID is 1 to %d letters, digits, '-' or '_'\n", ACCOUNT_ID_SIZE - 1);
+        return;
+    }
+    mine_solo(library, miner_id);
+}
+
+static void cloud_mining(LibrarySystem *library)
+{
+    char renter_id[ID_INPUT_SIZE];
+    prompt_text("Member renting the mining power: ", renter_id, sizeof(renter_id));
+    if (find_member(&library->registry, renter_id) == NULL) {
+        printf("ERROR: Book or Member not found\n");
+        return;
+    }
+    int rounds;
+    if (prompt_number("Rental duration in rounds (1-5): ", MIN_RENTAL_ROUNDS, MAX_RENTAL_ROUNDS, &rounds)) {
+        mine_cloud(library, renter_id, rounds);
+    }
+}
+
+static void tamper_with_block(Block *block)
+{
+    if (block->token_reward > 0) {
+        printf("change block %d reward from %d to %d coins", block->index, block->token_reward, TAMPERED_REWARD);
+        block->token_reward = TAMPERED_REWARD;
+    } else {
+        const char *forged_action = strcmp(block->action, ACTION_BORROWED) == 0 ? ACTION_RETURNED : ACTION_BORROWED;
+        printf("change block %d action from %s to %s", block->index, block->action, forged_action);
+        strcpy(block->action, forged_action);
+    }
+}
+
+/*
+ * Works on a copy of the chain, so chain.txt is never touched. Step 1 edits
+ * a block. Step 2 does what a determined attacker would: recompute the
+ * reward transaction id and redo the proof of work for the edited block and
+ * every block after it. Only the signature check still catches step 2.
  */
 static void run_tamper_demo(const LibrarySystem *library)
 {
-    static Blockchain copy;
-    const Blockchain *chain = &library->chain;
-
+    const BlockList *chain = &library->chain;
     if (chain->count < 2) {
-        printf("Record at least one borrow first, the genesis block has no lending data to tamper with.\n");
+        printf("Mine at least one lending record first, the genesis block has no lending data to tamper with.\n");
         return;
     }
 
-    char input[INPUT_SIZE];
     int target;
     printf("This demo edits a copy of the chain in memory, %s is not modified.\n", CHAIN_FILE);
-    printf("Block to tamper with (1-%d): ", chain->count - 1);
-    fflush(stdout);
-    read_line(input, sizeof(input));
-    if (sscanf(input, "%d", &target) != 1 || target < 1 || target >= chain->count) {
-        printf("ERROR: invalid block number\n");
+    if (!prompt_number("Block to tamper with: ", 1, chain->count - 1, &target)) {
         return;
     }
 
-    copy = *chain;
-    Block *block = &copy.blocks[target];
-    const char *forged_action = strcmp(block->action, ACTION_RETURNED) == 0 ? ACTION_BORROWED : ACTION_RETURNED;
+    BlockList copy = {0};
+    for (int i = 0; i < chain->count; i++) {
+        if (!block_list_append(&copy, &chain->blocks[i])) {
+            block_list_free(&copy);
+            return;
+        }
+    }
+    Block *forged = &copy.blocks[target];
 
-    printf("\nStep 1: change block %d action from %s to %s, leaving its hash and signature as they were.\n\n",
-           target, block->action, forged_action);
-    strcpy(block->action, forged_action);
+    printf("\nStep 1: ");
+    tamper_with_block(forged);
+    printf(", leaving its hash, proof of work and signature as they were.\n\n");
     validate_chain(&copy, library->public_key, true);
 
-    printf("\nStep 2: recompute the hash of block %d and every block after it, relinking the chain.\n\n", target);
+    printf("\nStep 2: recompute the transaction id, then redo the proof of work for block %d and every block after it.\n",
+           target);
+    if (forged->token_reward > 0) {
+        Transaction forged_reward;
+        make_reward_transaction(&forged_reward, forged->member_id, forged->token_reward, forged->book_id, forged->timestamp);
+        strcpy(forged->transaction_id, forged_reward.txid);
+    }
+    unsigned long attempts = 0;
     for (int i = target; i < copy.count; i++) {
         strcpy(copy.blocks[i].previous_hash, copy.blocks[i - 1].hash);
-        compute_block_hash(&copy.blocks[i], copy.blocks[i].hash);
+        copy.blocks[i].nonce = 0;
+        search_nonce(&copy.blocks[i], ULONG_MAX, &attempts);
     }
+    printf("Re-mined %d blocks in %lu hash attempts.\n\n", copy.count - target, attempts);
     validate_chain(&copy, library->public_key, true);
 
-    printf("\nHashes and links are consistent again, but block %d still fails its signature check.\n", target);
-    printf("Re-signing it would need the librarian's private key, which the attacker does not have.\n");
+    printf("\nHashes, links, proof of work and the reward transaction id are all consistent again, but block %d\n"
+           "still fails its signature check. Forging it would need the librarian's private key.\n", target);
+    printf("Re-mining cost %lu attempts here; at a higher difficulty or with more blocks after the edit it grows quickly.\n",
+           attempts);
+    block_list_free(&copy);
 }
 
 static void print_menu(const LibrarySystem *library)
 {
     printf("\n===== Library Lending Tracker =====\n");
-    printf("Books %d | Members %d | Blocks %d | Librarian %s\n",
-           library->registry.book_count, library->registry.member_count, library->chain.count,
-           library->private_key != NULL ? "logged in" : "logged out");
-    printf("  1. View registries\n");
-    printf("  2. Borrow a book\n");
-    printf("  3. Return a book\n");
-    printf("  4. Mark a book overdue\n");
-    printf("  5. View lending records\n");
-    printf("  6. Validate chain\n");
-    printf("  7. Tamper detection demo\n");
-    printf("  8. Log out\n");
-    printf("  0. Exit\n");
-    printf("Choice: ");
-    fflush(stdout);
+    printf("Model %s | Difficulty %d | Chain %d | Pending %d | Librarian %s\n",
+           model_name(library->ledger.model), library->difficulty, library->chain.count,
+           library->pending.count, library->private_key != NULL ? "logged in" : "logged out");
+    printf("  1. View registries          10. Validate chain and ledger\n");
+    printf("  2. Borrow a book            11. View balances / UTXO set\n");
+    printf("  3. Return a book            12. Transfer tokens\n");
+    printf("  4. Mark a book overdue      13. Transaction history\n");
+    printf("  5. View pending pool        14. Double-spend test (replay last transfer)\n");
+    printf("  6. Mine: solo               15. Set mining difficulty\n");
+    printf("  7. Mine: pool               16. Tamper detection demo\n");
+    printf("  8. Mine: cloud rental       17. Log out\n");
+    printf("  9. View confirmed records    0. Exit\n");
 }
 
 static void run_menu(LibrarySystem *library)
 {
-    char choice[INPUT_SIZE];
-
     for (;;) {
         print_menu(library);
-        if (!read_line(choice, sizeof(choice))) {
-            printf("\n");
-            return;
-        }
-        if (strlen(choice) != 1) {
-            printf("Invalid choice.\n");
+        int choice;
+        if (!prompt_number("Choice: ", 0, 17, &choice)) {
+            if (feof(stdin)) {
+                printf("\n");
+                return;
+            }
             continue;
         }
 
-        switch (choice[0]) {
-        case '1': view_registries(library); break;
-        case '2': borrow_book(library); break;
-        case '3': return_book(library); break;
-        case '4': mark_overdue(library); break;
-        case '5': view_records(library); break;
-        case '6': validate_chain(&library->chain, library->public_key, true); break;
-        case '7': run_tamper_demo(library); break;
-        case '8': logout(library); break;
-        case '0': return;
-        default: printf("Invalid choice.\n");
+        switch (choice) {
+        case 1: view_registries(library); break;
+        case 2: borrow_book(library); break;
+        case 3: return_book(library); break;
+        case 4: mark_overdue(library); break;
+        case 5: view_pending_pool(library); break;
+        case 6: solo_mining(library); break;
+        case 7: mine_pool(library); break;
+        case 8: cloud_mining(library); break;
+        case 9: view_records(library); break;
+        case 10: library_is_consistent(library, true); break;
+        case 11: view_balances(library); break;
+        case 12: transfer_tokens(library); break;
+        case 13: show_history(library); break;
+        case 14: ledger_replay_last_transfer(&library->ledger); break;
+        case 15: set_difficulty(library); break;
+        case 16: run_tamper_demo(library); break;
+        case 17: logout(library); break;
+        case 0: return;
         }
     }
 }
 
-int main(void)
+int main(int argc, char *argv[])
 {
-    static LibrarySystem library;
+    bool model_given = false;
+    LedgerModel model = MODEL_UTXO;
+    int difficulty = DEFAULT_DIFFICULTY;
 
-    if (!load_registry(&library.registry, BOOKS_FILE, MEMBERS_FILE)) {
+    if (!parse_arguments(argc, argv, &model_given, &model, &difficulty)) {
+        print_usage(argv[0]);
         return EXIT_FAILURE;
     }
-    printf("Loaded %d books from %s and %d members from %s.\n",
-           library.registry.book_count, BOOKS_FILE, library.registry.member_count, MEMBERS_FILE);
+    if (!model_given && !choose_model(&model)) {
+        return EXIT_FAILURE;
+    }
+    srand((unsigned int)time(NULL));
 
-    bool ready = setup_keys(&library)
-        && load_chain(&library.chain, CHAIN_FILE)
-        && create_chain_if_missing(&library);
-
-    if (ready) {
-        printf("Chain loaded from %s, blocks: %d\n", CHAIN_FILE, library.chain.count);
-        if (!validate_chain(&library.chain, library.public_key, false)) {
-            printf("WARNING: %s failed validation. Use option 6 for details. New records are blocked.\n", CHAIN_FILE);
-        }
+    LibrarySystem library = {0};
+    bool opened = library_open(&library, model, difficulty);
+    if (opened) {
         run_menu(&library);
     }
-
-    EVP_PKEY_free(library.private_key);
-    EVP_PKEY_free(library.public_key);
-    return ready ? EXIT_SUCCESS : EXIT_FAILURE;
+    library_close(&library);
+    return opened ? EXIT_SUCCESS : EXIT_FAILURE;
 }
