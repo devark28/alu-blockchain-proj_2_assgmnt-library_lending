@@ -1,5 +1,8 @@
 docs/
 q1_library_lending/library_tracker
 q1_library_lending/chain.txt
+q1_library_lending/pending.txt
+q1_library_lending/transactions.txt
+q1_library_lending/*.tmp
 q1_library_lending/keys/
 *.o
